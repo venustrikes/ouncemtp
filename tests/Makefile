@@ -12,7 +12,12 @@ build/host_mtp: $(SRCS) $(wildcard ../source/*.h)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ $(SRCS) -lpthread
 
-test: build/host_mtp
+build/rx_header_test: rx_header_test.c ../source/mtp.c $(wildcard ../source/*.h)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections -o $@ $<
+
+test: build/host_mtp build/rx_header_test
+	./build/rx_header_test
 	python3 mtp_test.py build/host_mtp 512
 	python3 mtp_test.py build/host_mtp 1024
 

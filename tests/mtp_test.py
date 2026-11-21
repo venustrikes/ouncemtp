@@ -93,8 +93,10 @@ class Host:
             if n == 0 or n % MPS != 0:
                 return bytes(acc)
 
-    def send_data(self, code, payload, mode, unknown_len=False):
+    def send_data(self, code, payload, mode, unknown_len=False, header_length=None):
         length = 0xFFFFFFFF if unknown_len else 12 + len(payload)
+        if header_length is not None:
+            length = header_length
         hdr = struct.pack("<IHHI", length, DATA, code, self.tid)
         total = 12 + len(payload)
         if mode == "split":                         # header as its own transfer
@@ -107,12 +109,12 @@ class Host:
             if total % MPS == 0 and mode != "nozlp":
                 self.out_transfer(b"")              # spec-mandated ZLP
 
-    def op(self, code, params=(), data_out=None, mode="glued", unknown_len=False, expect_data=None):
+    def op(self, code, params=(), data_out=None, mode="glued", unknown_len=False, expect_data=None, header_length=None):
         self.tid += 1
         cmd = struct.pack("<IHHI", 12 + 4 * len(params), CMD, code, self.tid) + b"".join(struct.pack("<I", p) for p in params)
         self.out_transfer(cmd)
         if data_out is not None:
-            self.send_data(code, data_out, mode, unknown_len)
+            self.send_data(code, data_out, mode, unknown_len, header_length)
         t = self.in_transfer()
         data = None
         ln, ty, cd, tid = struct.unpack_from("<IHHI", t)
@@ -139,7 +141,14 @@ def run(root, mps_label):
     env = dict(os.environ, MTP_MPS=str(MPS), ASAN_OPTIONS="detect_leaks=1")
     proc = subprocess.Popen([BIN, root, sockpath], env=env, stderr=subprocess.PIPE, text=True)
     srv.settimeout(10)
-    conn, _ = srv.accept()
+    try:
+        conn, _ = srv.accept()
+    except BaseException:
+        proc.kill()
+        _, err = proc.communicate()
+        srv.close(); os.unlink(sockpath)
+        print("Responder failed before connecting:\n" + err[-4000:])
+        raise
     conn.settimeout(30)
     h = Host(conn)
     rnd = random.Random(1234)
@@ -269,6 +278,23 @@ def run(root, mps_label):
     rc, rp, _ = h.op(0x100C, (STORAGE, 0xFFFFFFFF), data_out=object_info("unknown_len.bin", 0xFFFFFFFF))
     rc, _, _ = h.op(0x100D, (), data_out=payload, unknown_len=True)
     check(rc == OK and open(os.path.join(root, "unknown_len.bin"), "rb").read() == payload, "unknown-length SendObject")
+
+    # Actual Windows large-upload capture: unknown ObjectInfo size and a data
+    # ContainerLength of 11, i.e. (0xFFFFFFFF + 12) modulo 2**32.
+    # Small synthetic streams reproduce framing without allocating 25.6 GB.
+    for mode, count in (("glued", 2 * (1 << 20) + 333),
+                        ("split", 2 * (1 << 20) + 333),
+                        ("glued", 2 * (1 << 20) - 12),
+                        ("split", 2 * (1 << 20))):
+        payload = rnd.randbytes(count)
+        name = f"windows_unknown_{mode}_{count}.bin"
+        rc, _, _ = h.op(0x100C, (STORAGE, 0xFFFFFFFF), data_out=object_info(name, 0xFFFFFFFF))
+        check(rc == OK, "Windows wrapped-length object info")
+        rc, _, _ = h.op(0x100D, data_out=payload, mode=mode, header_length=11)
+        check(rc == OK and open(os.path.join(root, name), "rb").read() == payload,
+              f"Windows wrapped-length {mode} payload={count}")
+        rc, _, _ = h.op(0x1004)
+        check(rc == OK, "pipe synchronized after Windows wrapped-length upload")
 
     # SendObjectInfo size disagrees with the data header: the header wins
     for announced, real in ((100, 5000), (3 * (1 << 20), 700), (10, 2 * (1 << 20) + MPS - 12)):

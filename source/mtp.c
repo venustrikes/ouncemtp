@@ -422,7 +422,7 @@ typedef struct {
  * Even when the sink fails (disk full) the whole phase is drained, because
  * the host will not listen for our response until it has sent everything.
  */
-static int rx_stream(uint64_t hint, sink_fn sink, void *ctx, rx_result_t *res, bool track)
+static int rx_stream(uint64_t hint, sink_fn sink, void *ctx, rx_result_t *res, bool track, const req_t *request)
 {
     const uint32_t mps = tp_max_packet();
     uint8_t  hdr[12];
@@ -458,6 +458,14 @@ static int rx_stream(uint64_t hint, sink_fn sink, void *ctx, rx_result_t *res, b
             if (hdr_have == 12) {
                 uint32_t len = rd32(hdr);
                 if (rd16(hdr + 4) != CT_DATA) return TP_ERROR;   /* host skipped the data phase */
+                if (request && (rd16(hdr + 6) != request->code || rd32(hdr + 8) != request->tid))
+                    return TP_ERROR;
+                /* Windows has been observed sending 11 for an unknown-size
+                 * upload, consistent with (0xFFFFFFFF + 12) wrapping to u32.
+                 * Treat this exact value as unknown only for the matching
+                 * pending SendObject, not for datasets or known-size files. */
+                if (len == 11 && hint == LEN_UNKNOWN && request && request->code == OP_SendObject)
+                    len = 0xFFFFFFFFu;
                 if (len != 0xFFFFFFFFu) {
                     if (len < 12) return TP_ERROR;
                     expected = len - 12;
@@ -504,7 +512,7 @@ static int rx_stream(uint64_t hint, sink_fn sink, void *ctx, rx_result_t *res, b
 static int drain_data(void)
 {
     rx_result_t res;
-    return rx_stream(LEN_UNKNOWN, NULL, NULL, &res, false);
+    return rx_stream(LEN_UNKNOWN, NULL, NULL, &res, false, NULL);
 }
 
 static int dbuf_sink(void *ctx, const uint8_t *data, uint32_t n)
@@ -520,7 +528,7 @@ static int recv_dataset(bool *ok)
 {
     rx_result_t res;
     dbuf_reset(&g_db);
-    int r = rx_stream(LEN_UNKNOWN, dbuf_sink, &g_db, &res, false);
+    int r = rx_stream(LEN_UNKNOWN, dbuf_sink, &g_db, &res, false, NULL);
     *ok = (r == TP_OK) && res.complete && !res.sink_failed;
     return r;
 }
@@ -932,7 +940,6 @@ static int op_send_object_info(const req_t *rq, resp_t *rs)
 
 static int op_send_object(const req_t *rq, resp_t *rs)
 {
-    (void)rq;
     char path[OBJ_PATH_MAX], sz[32], name[STATUS_LINE_LEN];
 
     if (!g_pend_valid || !objdb_valid(g_pend_handle) || !objdb_path(g_pend_handle, path, sizeof(path))) {
@@ -955,7 +962,7 @@ static int op_send_object(const req_t *rq, resp_t *rs)
 
     status_xfer_begin(DIR_TO_SWITCH, name, hint);
     rx_result_t res;
-    int r = rx_stream(hint, (f.fd >= 0 && !f.err) ? file_sink : NULL, &f, &res, true);
+    int r = rx_stream(hint, (f.fd >= 0 && !f.err) ? file_sink : NULL, &f, &res, true, rq);
 
     bool ok = (r == TP_OK) && f.fd >= 0 && !f.err && !res.sink_failed && res.complete;
     if (f.fd >= 0) {
@@ -1236,7 +1243,7 @@ static int op_send_partial_object(const req_t *rq, resp_t *rs)
     filesink_t f = { open(path, O_WRONLY), 0 };
     if (f.fd >= 0 && lseek(f.fd, (off_t)off, SEEK_SET) < 0) { close(f.fd); f.fd = -1; }
     rx_result_t res;
-    int r = rx_stream(rq->p[3], f.fd >= 0 ? file_sink : NULL, &f, &res, false);
+    int r = rx_stream(rq->p[3], f.fd >= 0 ? file_sink : NULL, &f, &res, false, NULL);
     if (f.fd >= 0 && close(f.fd) != 0) f.err = EIO;
     if (r) return r;
     if (f.fd < 0 || f.err || res.sink_failed) rs->code = f.err == ENOSPC ? RC_StoreFull : RC_GeneralError;
